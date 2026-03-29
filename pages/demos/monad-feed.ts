@@ -53,10 +53,48 @@ type Interval = {
   right: number
 }
 
-type CircleObstacle = {
+// Inner diamond vertices in SVG coords (viewBox 90 90 300 300)
+// Converted to normalized [0,1] relative to logo display size
+const DIAMOND_SVG = [
+  { x: 154.285, y: 216.624 }, // left
+  { x: 263.533, y: 154.226 }, // top
+  { x: 325.989, y: 263.376 }, // right
+  { x: 216.739, y: 325.774 }, // bottom
+]
+const DIAMOND_NORM = DIAMOND_SVG.map(p => ({ x: (p.x - 90) / 300, y: (p.y - 90) / 300 }))
+
+// Get the horizontal extent [left, right] of the diamond polygon at a given y (normalized)
+function diamondIntervalAtY(y: number): { left: number, right: number } | null {
+  const pts = DIAMOND_NORM
+  const n = pts.length
+  let minX = Infinity
+  let maxX = -Infinity
+  let hits = 0
+
+  for (let i = 0; i < n; i++) {
+    const a = pts[i]!
+    const b = pts[(i + 1) % n]!
+    const yMin = Math.min(a.y, b.y)
+    const yMax = Math.max(a.y, b.y)
+    if (y < yMin || y > yMax || yMin === yMax) continue
+    const t = (y - a.y) / (b.y - a.y)
+    const x = a.x + t * (b.x - a.x)
+    if (x < minX) minX = x
+    if (x > maxX) maxX = x
+    hits++
+  }
+
+  if (hits < 2) return null
+  return { left: minX, right: maxX }
+}
+
+type LogoObstacle = {
   cx: number
   cy: number
-  r: number
+  outerR: number
+  logoX: number
+  logoY: number
+  logoSize: number
 }
 
 // ── Logo ───────────────────────────────────────────────────────────────
@@ -504,14 +542,35 @@ const GUTTER = 48
 const COL_GAP = 40
 const MIN_SLOT_WIDTH = 50
 
-function circleIntervalForBand(
-  o: CircleObstacle, bandTop: number, bandBottom: number,
-): Interval | null {
-  if (bandTop >= o.cy + o.r || bandBottom <= o.cy - o.r) return null
-  const minDy = o.cy >= bandTop && o.cy <= bandBottom ? 0 : o.cy < bandTop ? bandTop - o.cy : o.cy - bandBottom
-  if (minDy >= o.r) return null
-  const dx = Math.sqrt(o.r * o.r - minDy * minDy)
-  return { left: o.cx - dx, right: o.cx + dx }
+function logoRingIntervalsForBand(
+  o: LogoObstacle, bandTop: number, bandBottom: number,
+): Interval[] {
+  // Outer circle chord
+  if (bandTop >= o.cy + o.outerR || bandBottom <= o.cy - o.outerR) return []
+  const outerMinDy = o.cy >= bandTop && o.cy <= bandBottom ? 0 : o.cy < bandTop ? bandTop - o.cy : o.cy - bandBottom
+  if (outerMinDy >= o.outerR) return []
+  const outerDx = Math.sqrt(o.outerR * o.outerR - outerMinDy * outerMinDy)
+  const outerLeft = o.cx - outerDx
+  const outerRight = o.cx + outerDx
+
+  // Inner diamond at the band midpoint (normalized y)
+  const bandMidY = ((bandTop + bandBottom) / 2 - o.logoY) / o.logoSize
+  const inner = diamondIntervalAtY(bandMidY)
+
+  if (!inner) {
+    // Band outside the diamond — entire outer chord is blocked
+    return [{ left: outerLeft, right: outerRight }]
+  }
+
+  // Convert normalized inner coords to page coords
+  const innerLeft = o.logoX + inner.left * o.logoSize
+  const innerRight = o.logoX + inner.right * o.logoSize
+
+  // Two blocked arcs: left ring wall and right ring wall
+  const result: Interval[] = []
+  if (innerLeft - outerLeft > 2) result.push({ left: outerLeft, right: innerLeft })
+  if (outerRight - innerRight > 2) result.push({ left: innerRight, right: outerRight })
+  return result
 }
 
 function carveTextLineSlots(base: Interval, blocked: Interval[]): Interval[] {
@@ -538,7 +597,7 @@ function layoutColumn(
   startCursor: LayoutCursor,
   regionX: number, regionY: number, regionW: number, regionH: number,
   lineHeight: number,
-  obstacles: CircleObstacle[],
+  obstacles: LogoObstacle[],
 ): { lines: PositionedLine[], cursor: LayoutCursor } {
   let cursor = startCursor
   let lineTop = regionY
@@ -551,8 +610,8 @@ function layoutColumn(
     const blocked: Interval[] = []
 
     for (let i = 0; i < obstacles.length; i++) {
-      const interval = circleIntervalForBand(obstacles[i]!, bandTop, bandBottom)
-      if (interval !== null) blocked.push(interval)
+      const intervals = logoRingIntervalsForBand(obstacles[i]!, bandTop, bandBottom)
+      for (let j = 0; j < intervals.length; j++) blocked.push(intervals[j]!)
     }
 
     const slots = carveTextLineSlots({ left: regionX, right: regionX + regionW }, blocked)
@@ -687,10 +746,13 @@ function commitFrame(): void {
   logoEl.style.width = `${logo.size}px`
   logoEl.style.height = `${logo.size}px`
 
-  const obstacle: CircleObstacle = {
+  const obstacle: LogoObstacle = {
     cx: logo.x + logo.size / 2,
     cy: logo.y + logo.size / 2,
-    r: logo.size / 2,
+    outerR: logo.size / 2,
+    logoX: logo.x,
+    logoY: logo.y,
+    logoSize: logo.size,
   }
 
   // Multi-column layout
@@ -729,10 +791,8 @@ async function main(): Promise<void> {
   stage = document.getElementById('stage') as HTMLDivElement
   logoEl = document.getElementById('monad-logo') as HTMLImageElement
   loadingEl = document.getElementById('loading') as HTMLDivElement
-  const loadingLogoEl = document.getElementById('loading-logo') as HTMLImageElement
   logoEl.src = MONAD_LOGO_SRC
   logoEl.style.display = 'none'
-  loadingLogoEl.src = MONAD_LOGO_SRC
 
   connect()
 
